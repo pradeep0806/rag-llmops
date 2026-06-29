@@ -1,0 +1,35 @@
+# bentofile.yaml — BentoML build specification
+#
+# Think of this as a Dockerfile but ML-aware.
+# `bentoml build` reads this and creates a versioned Bento snapshot.
+#
+# The Bento contains:
+#   - your service code
+#   - exact Python + package versions
+#   - model references (if using BentoML model store)
+#   - this spec file
+
+service: "bento.service:RAGService"   # module:class
+
+name: rag-llmops
+
+labels:
+  owner: pradeep
+  project: rag-llmops
+  stage: dev
+
+include:
+  - "src/"           # RAG pipeline code
+  - "bento/"         # service definition
+  - ".env"           # config
+  - "data/"          # papers (for demo)
+
+python:
+  requirements_txt: "./requirements-bento.txt"   # separate from dev deps
+
+docker:
+  python_version: "3.11"
+  env:
+    - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    - QDRANT_HOST=qdrant
+    - QDRANT_PORT=6333
