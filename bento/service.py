@@ -22,7 +22,7 @@ import sys
 import logging
 from pathlib import Path
 import time
-from rag_chain import format_docs, build_prompt, call_ollama
+from src.rag_chain import format_docs, build_prompt, call_ollama
 
 # Add src/ to path so we can import our modules
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -76,7 +76,7 @@ class RAGService:
         This is where we build the retriever (expensive operation).
         """
         log.info("Initializing RAG service...")
-        from rag_chain import get_retriever
+        from src.rag_chain import get_retriever
 
         self._retriever = get_retriever()
         log.info("RAG service ready")
@@ -109,7 +109,7 @@ class RAGService:
     @bentoml.api(route="/ingest")
     async def ingest(self, req: IngestRequest) -> dict:
         """Trigger document ingestion into Qdrant."""
-        from ingest import ingest as run_ingest
+        from src.ingest import ingest as run_ingest
 
         log.info(f"Ingestion triggered: {req.data_dir}")
         run_ingest(req.data_dir)

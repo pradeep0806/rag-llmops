@@ -17,24 +17,24 @@ PDF Documents
      ↓
  Prometheus + Grafana (observability)
      ↓
- MLflow (experiment tracking)
+ MLflow (experiment tracking + evaluation)
 ```
 
 ## Stack
 
-| Layer                 | Tool                                                                      |
-| --------------------- | ------------------------------------------------------------------------- |
-| LLM                   | Ollama (`qwen3.5:9b`) — local, no API cost                                |
-| Embeddings            | `nomic-embed-text` via Ollama (768-dim)                                   |
-| Vector Store          | Qdrant (HNSW approximate nearest neighbor)                                |
-| RAG Orchestration     | LangChain LCEL                                                            |
-| API                   | FastAPI                                                                   |
-| Serving               | BentoML                                                                   |
-| Evaluation            | RAGAS (faithfulness, answer relevancy, context precision, context recall) |
-| Experiment Tracking   | MLflow                                                                    |
-| Metrics               | Prometheus + Grafana                                                      |
-| Dependency Management | `uv` + `pyproject.toml`                                                   |
-| Infra                 | Docker Compose                                                            |
+| Layer                 | Tool                                                           |
+| --------------------- | -------------------------------------------------------------- |
+| LLM                   | Ollama (`qwen3.5:9b`) — local, no API cost                     |
+| Embeddings            | `nomic-embed-text` via Ollama (768-dim)                        |
+| Vector Store          | Qdrant (HNSW approximate nearest neighbor)                     |
+| RAG Orchestration     | LangChain LCEL                                                 |
+| API                   | FastAPI                                                        |
+| Serving               | BentoML                                                        |
+| Evaluation            | Custom LLM-as-judge (RAGAS-style metrics, no RAGAS dependency) |
+| Experiment Tracking   | MLflow                                                         |
+| Metrics               | Prometheus + Grafana                                           |
+| Dependency Management | `uv` + `pyproject.toml`                                        |
+| Infra                 | Docker Compose                                                 |
 
 ## Project Structure
 
@@ -44,7 +44,7 @@ rag-llmops/
 │   ├── ingest.py        # PDF → chunk → embed → Qdrant
 │   ├── rag_chain.py     # retriever + Ollama generation
 │   ├── api.py           # FastAPI endpoints + Prometheus metrics
-│   └── evaluate.py      # RAGAS evaluation + MLflow logging
+│   └── evaluate.py      # LLM-as-judge evaluation + MLflow logging
 ├── bento/
 │   └── service.py       # BentoML service definition
 ├── observability/
@@ -88,7 +88,7 @@ docker compose up qdrant mlflow prometheus loki grafana -d
 
 ### 4. Add documents
 
-Drop PDF files into `data/papers/`. The repo includes scripts to download AI papers:
+Drop PDF files into `data/papers/`:
 
 ```bash
 curl -L "https://arxiv.org/pdf/1706.03762" -o data/papers/attention.pdf
@@ -130,20 +130,64 @@ curl -X POST http://localhost:8051/query \
 
 ## Evaluation
 
-Run RAGAS evaluation and log results to MLflow:
+### Why not RAGAS?
+
+RAGAS (the standard RAG evaluation library) has a known breaking incompatibility with LangChain v0.3+. It internally imports `langchain_community.chat_models.vertexai` which was removed in v0.3, making it impossible to use alongside a modern LangChain stack without downgrading the entire dependency tree.
+
+### Custom LLM-as-Judge Implementation
+
+Instead of RAGAS, we implement the same 4 metrics from scratch using direct Ollama API calls — the LLM itself acts as the judge. Same mathematical definitions, zero external dependency, full control over prompts.
+
+**Faithfulness** — are answers grounded in retrieved context?
+
+```
+Faithfulness = supported_claims / total_claims
+```
+
+The LLM decomposes the answer into atomic claims, then checks each claim against the retrieved context (YES/NO per claim).
+
+**Answer Relevancy** — does the answer address the question?
+
+```
+Answer Relevancy = cosine_sim(embed(answer), embed(question))
+```
+
+Embeds both question and answer via `nomic-embed-text`, computes cosine similarity. High score = answer is semantically on-topic.
+
+**Context Recall** — does retrieved context cover the ground truth?
+
+```
+Context Recall = ground_truth_claims_found_in_context / total_ground_truth_claims
+```
+
+The LLM scores what fraction of the ground truth is present in the retrieved chunks (0.0–1.0).
+
+**Context Precision** — are retrieved chunks actually relevant?
+
+```
+Context Precision = relevant_chunks / total_chunks_retrieved
+```
+
+Each retrieved chunk is individually judged for relevance to the question.
+
+### Baseline Results (qwen3.5:9b, top_k=5, chunk_size=512)
+
+| Metric            | Score | Interpretation                                                |
+| ----------------- | ----- | ------------------------------------------------------------- |
+| Faithfulness      | 0.80  | 80% of answer claims grounded in context                      |
+| Answer Relevancy  | 0.81  | Answers semantically close to questions                       |
+| Context Recall    | 0.75  | 75% of ground truth covered by retrieval                      |
+| Context Precision | 0.40  | 40% of retrieved chunks are relevant — retriever over-fetches |
+
+**Key insight from evaluation:** Context Precision at 0.40 indicates the retriever is pulling irrelevant chunks into the top-5. Actionable fix: reduce `TOP_K` from 5 to 3, or add a cross-encoder reranker (e.g. `ms-marco-MiniLM`) as a second-stage filter.
+
+### Run evaluation
 
 ```bash
 PYTHONPATH=src uv run python src/evaluate.py
 ```
 
-View results at `http://localhost:5000`
-
-Metrics tracked:
-
-- **Faithfulness** — are answers grounded in retrieved context?
-- **Answer Relevancy** — does the answer address the question?
-- **Context Precision** — are relevant chunks ranked first?
-- **Context Recall** — does retrieved context cover the ground truth?
+Results are logged to MLflow at `http://localhost:5000` — every run tracked with model config, chunk settings, and all 4 metric scores for comparison across experiments.
 
 ## Observability
 
@@ -156,7 +200,7 @@ Metrics tracked:
 
 Custom Prometheus metrics:
 
-- `rag_query_latency_seconds` — end-to-end latency histogram
+- `rag_query_latency_seconds` — end-to-end latency histogram (p50, p95, p99)
 - `rag_queries_total` — query count by status (success/error)
 - `rag_context_chunks` — chunks retrieved per query
 - `rag_retrieval_latency_seconds` — Qdrant retrieval latency
@@ -187,7 +231,9 @@ Documents split with `RecursiveCharacterTextSplitter` (chunk_size=512, overlap=6
 
 **Why direct Ollama API over LangChain's OllamaLLM?** Qwen3's `think=False` parameter (disables chain-of-thought, cuts latency from ~60s to ~20s) is only respected at the raw API level — LangChain's wrapper doesn't pass it through.
 
-**Why uv over pip/poetry?** Rust-based resolver — 10-100x faster installs, deterministic lockfile, no dependency conflicts.
+**Why uv over pip/poetry?** Rust-based resolver — 10-100x faster installs, deterministic lockfile (`uv.lock`), no dependency conflicts.
+
+**Why custom evaluation over RAGAS?** RAGAS is broken with LangChain v0.3+ due to a removed Vertex AI import. Custom implementation gives identical metrics, no version constraints, and full control over judge prompts.
 
 ## License
 
