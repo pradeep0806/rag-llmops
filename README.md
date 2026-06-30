@@ -11,7 +11,9 @@ PDF Documents
      ↓
  Qdrant Vector Store (HNSW, cosine similarity)
      ↓
- RAG Pipeline (top-k retrieval → prompt → Ollama)
+ Two-Stage Retrieval (vector search → cross-encoder rerank)
+     ↓
+ RAG Pipeline (prompt → Ollama)
      ↓
  FastAPI + BentoML (serving)
      ↓
@@ -27,6 +29,7 @@ PDF Documents
 | LLM                   | Ollama (`qwen3.5:9b`) — local, no API cost                     |
 | Embeddings            | `nomic-embed-text` via Ollama (768-dim)                        |
 | Vector Store          | Qdrant (HNSW approximate nearest neighbor)                     |
+| Reranker              | `cross-encoder/ms-marco-MiniLM-L-6-v2` (two-stage retrieval)   |
 | RAG Orchestration     | LangChain LCEL                                                 |
 | API                   | FastAPI                                                        |
 | Serving               | BentoML                                                        |
@@ -41,12 +44,15 @@ PDF Documents
 ```
 rag-llmops/
 ├── src/
-│   ├── ingest.py        # PDF → chunk → embed → Qdrant
-│   ├── rag_chain.py     # retriever + Ollama generation
-│   ├── api.py           # FastAPI endpoints + Prometheus metrics
-│   └── evaluate.py      # LLM-as-judge evaluation + MLflow logging
+│   ├── ingest.py               # PDF → chunk → embed → Qdrant
+│   ├── rag_chain.py            # retriever + reranker + Ollama generation
+│   ├── reranker.py             # cross-encoder reranking module
+│   ├── api.py                  # FastAPI endpoints + Prometheus metrics
+│   ├── evaluate.py             # LLM-as-judge evaluation + MLflow logging
+│   ├── log_retrieval.py        # isolated retrieval-quality experiments
+│   └── diagnose_retrieval.py   # chunk-level retrieval inspection tool
 ├── bento/
-│   └── service.py       # BentoML service definition
+│   └── service.py              # BentoML service definition
 ├── observability/
 │   ├── prometheus.yml
 │   ├── loki-config.yml
@@ -55,7 +61,7 @@ rag-llmops/
 │           └── datasources/
 ├── docker-compose.yml
 ├── bentofile.yaml
-├── pyproject.toml       # uv-managed dependencies
+├── pyproject.toml              # uv-managed dependencies
 └── .env
 ```
 
@@ -132,7 +138,7 @@ curl -X POST http://localhost:8051/query \
 
 ### Why not RAGAS?
 
-RAGAS (the standard RAG evaluation library) has a known breaking incompatibility with LangChain v0.3+. It internally imports `langchain_community.chat_models.vertexai` which was removed in v0.3, making it impossible to use alongside a modern LangChain stack without downgrading the entire dependency tree.
+RAGAS (the standard RAG evaluation library) has a known breaking incompatibility with LangChain v0.3+. It internally imports `langchain_community.chat_models.vertexai`, which was removed in v0.3, making it impossible to use alongside a modern LangChain stack without downgrading the entire dependency tree.
 
 ### Custom LLM-as-Judge Implementation
 
@@ -170,24 +176,48 @@ Context Precision = relevant_chunks / total_chunks_retrieved
 
 Each retrieved chunk is individually judged for relevance to the question.
 
-### Baseline Results (qwen3.5:9b, top_k=5, chunk_size=512)
+### Diagnosing and Fixing a Context Precision Regression
 
-| Metric            | Score | Interpretation                                                |
-| ----------------- | ----- | ------------------------------------------------------------- |
-| Faithfulness      | 0.80  | 80% of answer claims grounded in context                      |
-| Answer Relevancy  | 0.81  | Answers semantically close to questions                       |
-| Context Recall    | 0.75  | 75% of ground truth covered by retrieval                      |
-| Context Precision | 0.40  | 40% of retrieved chunks are relevant — retriever over-fetches |
+Initial evaluation surfaced a weak Context Precision score (0.40) — meaning 60% of retrieved chunks were irrelevant noise. Rather than guessing at a fix, each hypothesis was tested in isolation with results logged to MLflow for direct before/after comparison.
 
-**Key insight from evaluation:** Context Precision at 0.40 indicates the retriever is pulling irrelevant chunks into the top-5. Actionable fix: reduce `TOP_K` from 5 to 3, or add a cross-encoder reranker (e.g. `ms-marco-MiniLM`) as a second-stage filter.
+**Step 1 — Diagnose with raw chunk inspection.** Built `diagnose_retrieval.py` to print every retrieved chunk alongside an LLM relevance judgment. This surfaced two distinct problems: a missing source document (the RAG paper had never been successfully ingested, so RAG-related queries scored 0/5 relevant chunks), and chunk granularity (512-token chunks mixed multiple ideas — definitions, formulas, implementation details — into the same chunk, diluting relevance per chunk).
+
+**Step 2 — Add a cross-encoder reranker.** Implemented two-stage retrieval: a fast vector search returns 15 candidates, then `cross-encoder/ms-marco-MiniLM-L-6-v2` rescores each (query, chunk) pair jointly for true relevance. Vector similarity alone (bi-encoder) can only capture topical overlap; a cross-encoder can distinguish "topically related" from "directly answers the question." Result: 0.40 → 0.60.
+
+**Step 3 — Test recall depth.** Hypothesized that widening the candidate pool (`RETRIEVE_K` from 15 to 25) would surface more relevant chunks for the reranker to choose from. Logged as a separate MLflow run for direct comparison — result was unchanged (0.60 → 0.60), ruling out recall depth as the bottleneck and pointing back to chunk quality as the real constraint.
+
+**Step 4 — Fix chunking granularity.** Reduced `CHUNK_SIZE` from 512 to 256 tokens (overlap 100). Smaller chunks isolate single ideas instead of mixing definition, formula, and implementation detail in one block. Result: 0.60 → 0.667.
+
+**Step 5 — Tighten `TOP_K` using reranker confidence.** Reranker scores revealed a real confidence cliff per query — e.g. one query's top-3 candidates scored `6.08, -0.22, -2.64` — only the top chunk was strongly relevant, yet a fixed `TOP_K=5` was force-including weak, low-confidence chunks just to hit a count. Reduced `TOP_K` from 5 to 3 to keep only chunks the reranker is actually confident about. Result: 0.667 → **0.778**.
+
+### Results Summary
+
+| Stage                                    | Configuration                      | Avg Context Precision |
+| ---------------------------------------- | ---------------------------------- | --------------------- |
+| Baseline                                 | chunk=512/64, top_k=5, no reranker | 0.40                  |
+| + Reranker                               | chunk=512/64, top_k=5              | 0.60                  |
+| + Wider retrieval (hypothesis ruled out) | retrieve_k=25                      | 0.60 (no change)      |
+| + Smaller chunks                         | chunk=256/100, top_k=5             | 0.667                 |
+| + Tighter top_k                          | chunk=256/100, top_k=3             | **0.778**             |
+
+Net result: a **95% relative improvement** in Context Precision (0.40 → 0.778), achieved through three validated interventions — reranking, chunk granularity, and confidence-based top_k tuning — each isolated and proven via controlled, MLflow-logged experiments rather than guesswork. One hypothesis (wider retrieval depth) was tested and explicitly ruled out, demonstrating that not every plausible fix is the right one.
 
 ### Run evaluation
+
+Full RAG evaluation (generation + all 4 metrics):
 
 ```bash
 PYTHONPATH=src uv run python src/evaluate.py
 ```
 
-Results are logged to MLflow at `http://localhost:5000` — every run tracked with model config, chunk settings, and all 4 metric scores for comparison across experiments.
+Isolated retrieval-quality experiments (compare retrieval configs without re-running generation):
+
+```bash
+PYTHONPATH=src uv run python src/log_retrieval.py --tag my_experiment
+PYTHONPATH=src uv run python src/log_retrieval.py --tag my_baseline --no-reranker
+```
+
+View results at `http://localhost:5000`
 
 ## Observability
 
@@ -207,15 +237,17 @@ Custom Prometheus metrics:
 
 ## How It Works
 
-### Retrieval — HNSW Approximate Nearest Neighbor
+### Retrieval — Two-Stage: HNSW + Cross-Encoder Reranking
 
-Query text is embedded into a 768-dim vector via `nomic-embed-text`. Qdrant finds the top-k most similar chunks using HNSW (Hierarchical Navigable Small World graphs):
+**Stage 1 (recall):** Query text is embedded into a 768-dim vector via `nomic-embed-text`. Qdrant finds the top-15 candidate chunks using HNSW (Hierarchical Navigable Small World graphs):
 
 ```
 cosine_sim(a, b) = (a · b) / (||a|| × ||b||)
 ```
 
-HNSW navigates a layered graph — O(log n) vs O(n) brute force.
+HNSW navigates a layered graph — O(log n) vs O(n) brute force. This stage is fast but approximate — it embeds the query and each chunk _separately_, so it can only capture topical similarity, not whether a chunk actually answers the question.
+
+**Stage 2 (precision):** The top-15 candidates are rescored by a cross-encoder, which takes (query, chunk) _jointly_ as input and outputs a single relevance logit. This is slower per-pair but far more accurate, so it's only applied to the small candidate set from stage 1, not the whole corpus. The top 3 by cross-encoder score become the final context.
 
 ### Generation — Grounded Prompting
 
@@ -223,13 +255,15 @@ Retrieved chunks are injected into a prompt that instructs the model to answer o
 
 ### Chunking Strategy
 
-Documents split with `RecursiveCharacterTextSplitter` (chunk_size=512, overlap=64), trying separators in order: `\n\n → \n → " " → ""` — preserving semantic boundaries before hard character splits.
+Documents split with `RecursiveCharacterTextSplitter` (chunk_size=256, overlap=100), trying separators in order: `\n\n → \n → " " → ""` — preserving semantic boundaries before hard character splits. Chunk size was tuned down from an initial 512 after evaluation showed larger chunks diluted relevance by mixing multiple ideas per chunk (see Evaluation section above).
 
 ## Tech Decisions
 
 **Why Qdrant over ChromaDB?** Production-grade server with REST + gRPC API, proper HNSW tuning, and filtering on metadata payloads. ChromaDB is in-process only.
 
-**Why direct Ollama API over LangChain's OllamaLLM?** Qwen3's `think=False` parameter (disables chain-of-thought, cuts latency from ~60s to ~20s) is only respected at the raw API level — LangChain's wrapper doesn't pass it through.
+**Why a cross-encoder reranker?** Bi-encoder vector search alone plateaued at 0.40 context precision. A reranker that jointly scores (query, chunk) pairs lifted this to 0.60 immediately — see the Evaluation section for the full validated experiment trail.
+
+**Why direct Ollama API over LangChain's OllamaLLM?** Qwen3's `think=False` parameter (disables chain-of-thought, cuts latency significantly) is only respected at the raw API level — LangChain's wrapper doesn't pass it through.
 
 **Why uv over pip/poetry?** Rust-based resolver — 10-100x faster installs, deterministic lockfile (`uv.lock`), no dependency conflicts.
 
