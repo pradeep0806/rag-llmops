@@ -44,12 +44,14 @@ PDF Documents
 ```
 rag-llmops/
 ├── src/
-│   ├── ingest.py               # PDF → chunk → embed → Qdrant
+│   ├── ingest.py               # PDF → recursive chunk → embed → Qdrant (production)
+│   ├── ingest_semantic.py      # PDF → semantic chunk → embed → Qdrant (experiment)
+│   ├── ingest_structured.py    # PDF → section-aware chunk → embed → Qdrant (experiment)
 │   ├── rag_chain.py            # retriever + reranker + Ollama generation
 │   ├── reranker.py             # cross-encoder reranking module
 │   ├── api.py                  # FastAPI endpoints + Prometheus metrics
 │   ├── evaluate.py             # LLM-as-judge evaluation + MLflow logging
-│   ├── log_retrieval.py        # isolated retrieval-quality experiments
+│   ├── log_retrieval.py        # isolated retrieval-quality experiments (any collection)
 │   └── diagnose_retrieval.py   # chunk-level retrieval inspection tool
 ├── bento/
 │   └── service.py              # BentoML service definition
@@ -150,15 +152,11 @@ Instead of RAGAS, we implement the same 4 metrics from scratch using direct Olla
 Faithfulness = supported_claims / total_claims
 ```
 
-The LLM decomposes the answer into atomic claims, then checks each claim against the retrieved context (YES/NO per claim).
-
 **Answer Relevancy** — does the answer address the question?
 
 ```
 Answer Relevancy = cosine_sim(embed(answer), embed(question))
 ```
-
-Embeds both question and answer via `nomic-embed-text`, computes cosine similarity. High score = answer is semantically on-topic.
 
 **Context Recall** — does retrieved context cover the ground truth?
 
@@ -166,15 +164,11 @@ Embeds both question and answer via `nomic-embed-text`, computes cosine similari
 Context Recall = ground_truth_claims_found_in_context / total_ground_truth_claims
 ```
 
-The LLM scores what fraction of the ground truth is present in the retrieved chunks (0.0–1.0).
-
 **Context Precision** — are retrieved chunks actually relevant?
 
 ```
 Context Precision = relevant_chunks / total_chunks_retrieved
 ```
-
-Each retrieved chunk is individually judged for relevance to the question.
 
 ### Diagnosing and Fixing a Context Precision Regression
 
@@ -182,28 +176,41 @@ Initial evaluation surfaced a weak Context Precision score (0.40) — meaning 60
 
 **Step 1 — Diagnose with raw chunk inspection.** Built `diagnose_retrieval.py` to print every retrieved chunk alongside an LLM relevance judgment. This surfaced two distinct problems: a missing source document (the RAG paper had never been successfully ingested, so RAG-related queries scored 0/5 relevant chunks), and chunk granularity (512-token chunks mixed multiple ideas — definitions, formulas, implementation details — into the same chunk, diluting relevance per chunk).
 
-**Step 2 — Add a cross-encoder reranker.** Implemented two-stage retrieval: a fast vector search returns 15 candidates, then `cross-encoder/ms-marco-MiniLM-L-6-v2` rescores each (query, chunk) pair jointly for true relevance. Vector similarity alone (bi-encoder) can only capture topical overlap; a cross-encoder can distinguish "topically related" from "directly answers the question." Result: 0.40 → 0.60.
+**Step 2 — Add a cross-encoder reranker.** Implemented two-stage retrieval: a fast vector search returns 15 candidates, then `cross-encoder/ms-marco-MiniLM-L-6-v2` rescores each (query, chunk) pair jointly for true relevance. Vector similarity alone (bi-encoder) can only capture topical overlap; a cross-encoder can distinguish "topically related" from "directly answers the question." Result: 0.40 → 0.60 (on the initial 3-question test set).
 
-**Step 3 — Test recall depth.** Hypothesized that widening the candidate pool (`RETRIEVE_K` from 15 to 25) would surface more relevant chunks for the reranker to choose from. Logged as a separate MLflow run for direct comparison — result was unchanged (0.60 → 0.60), ruling out recall depth as the bottleneck and pointing back to chunk quality as the real constraint.
+**Step 3 — Test recall depth.** Hypothesized that widening the candidate pool (`RETRIEVE_K` from 15 to 25) would surface more relevant chunks for the reranker to choose from. Result was unchanged — ruling out recall depth as the bottleneck and pointing back to chunk quality.
 
-**Step 4 — Fix chunking granularity.** Reduced `CHUNK_SIZE` from 512 to 256 tokens (overlap 100). Smaller chunks isolate single ideas instead of mixing definition, formula, and implementation detail in one block. Result: 0.60 → 0.667.
+**Step 4 — Fix chunking granularity.** Reduced `CHUNK_SIZE` from 512 to 256 tokens (overlap 100). Smaller chunks isolate single ideas instead of mixing definition, formula, and implementation detail in one block.
 
-**Step 5 — Tighten `TOP_K` using reranker confidence.** Reranker scores revealed a real confidence cliff per query — e.g. one query's top-3 candidates scored `6.08, -0.22, -2.64` — only the top chunk was strongly relevant, yet a fixed `TOP_K=5` was force-including weak, low-confidence chunks just to hit a count. Tested `TOP_K=3`: context precision jumped to 0.778, but a full 4-metric evaluation (not just the isolated precision check) revealed a real cost — faithfulness dropped from 0.80 to 0.56 and context recall dropped from 0.75 to 0.58. Retrieving fewer, narrower chunks gave the model less material to construct a complete, well-grounded answer from — a textbook precision/recall tradeoff.
+**Step 5 — Tighten `TOP_K` using reranker confidence.** Reranker scores revealed a real confidence cliff per query — e.g. one query's candidates scored `6.08, -0.22, -2.64, ...` — only the top chunk was strongly relevant, yet a fixed `TOP_K=5` was force-including weak, low-confidence chunks just to hit a count. An aggressive `TOP_K=3` initially looked like a further win on context precision alone, but a full 4-metric evaluation revealed a real cost: faithfulness dropped from 0.80 to 0.56 and context recall dropped from 0.75 to 0.58 — fewer, narrower chunks gave the model less material to construct a complete, grounded answer from. `TOP_K=4` was identified as the balance point: faithfulness recovered to 0.73, answer relevancy stayed at 0.81, while context precision still nearly doubled the original baseline.
 
-**Step 6 — Find the balance point.** Tested `TOP_K=4` as a middle ground between the original 5 and the over-aggressive 3. This recovered faithfulness to 0.73 (close to the 0.80 baseline) while keeping context precision nearly double the original (0.75 vs 0.40), with answer relevancy unchanged. Context recall stayed flat at 0.58 between `top_k=3` and `top_k=4`, indicating recall is currently bottlenecked by chunk size, not top_k — a separate, known limitation rather than something tuning `top_k` further would fix.
+**Step 6 — Compare chunking strategies at scale.** With the pipeline stabilized at `chunk_size=256, top_k=4`, three chunking strategies were built and evaluated side by side in separate Qdrant collections: the production `RecursiveCharacterTextSplitter`, a `SemanticChunker` that splits on embedding-similarity drops between sentences (topic-shift-aware), and a custom structure-aware splitter that detects academic section headers (Introduction, Methods, References, etc.) and chunks within section boundaries, tagging each chunk's section in its metadata.
 
-### Results Summary
+The first comparison ran on the original 3-question test set and showed what looked like meaningful differences (0.75–0.92 across strategies) — but this turned out to be noise. With only 3 questions × 4 chunks = 12 LLM-judge calls per run, a single borderline judgment flip moves the average by over 8%, and the LLM judge is not perfectly consistent run-to-run. The test set was expanded to 8 questions (32 judgments per run) to get a statistically meaningful comparison.
 
-| Stage                      | Configuration                      | Faithfulness | Answer Relevancy | Context Recall | Context Precision |
-| -------------------------- | ---------------------------------- | ------------ | ---------------- | -------------- | ----------------- |
-| Baseline                   | chunk=512/64, top_k=5, no reranker | 0.80         | 0.81             | 0.75           | 0.40              |
-| + Reranker, smaller chunks | chunk=256/100, top_k=5             | —            | —                | —              | 0.667             |
-| Over-aggressive top_k      | chunk=256/100, top_k=3             | 0.56         | 0.79             | 0.58           | 0.778             |
-| **Final (balanced)**       | **chunk=256/100, top_k=4**         | **0.73**     | **0.81**         | **0.58**       | **0.75**          |
+### Results: Chunking Strategy Comparison (8-question test set)
 
-The final configuration nearly doubles context precision (0.40 → 0.75) while keeping faithfulness and answer relevancy close to their original levels. Context recall (0.75 → 0.58) is the one metric that didn't fully recover — it's bottlenecked by the smaller chunk size rather than `top_k`, and is documented here as a known, deliberate tradeoff rather than an unexamined regression.
+| Strategy                   | Avg Context Precision | Chunk Count |
+| -------------------------- | --------------------- | ----------- |
+| Recursive (production)     | 0.75                  | 2292        |
+| Semantic                   | 0.75                  | —           |
+| Structured (section-aware) | 0.75                  | 2061        |
 
-This process is the actual point: the first "improvement" (`top_k=3`, precision 0.778) looked like a win on a single metric but was a regression once measured against the full evaluation suite. Tracking all 4 metrics together — not optimizing one in isolation — is what caught it.
+All three strategies converge to the same 0.75 score at this corpus scale — chunking strategy made no measurable difference here, despite the apparent spread on the smaller 3-question test. This itself is a useful, validated finding: it shows the earlier-observed differences were an artifact of an undersized test set rather than a real effect of chunking algorithm choice.
+
+More informative than the strategy comparison is a consistent failure mode across **all three** strategies: the question _"What are the limitations of retrieval-augmented generation?"_ scored 0/4 or near-0/4 relevant chunks regardless of chunking method. This rules out chunking as the cause — no chunking algorithm can fix a problem where the target content isn't well-represented or well-matched in the embedding space to begin with. This points to either a genuine content gap (the source paper may not have a clearly demarcated "Limitations" discussion) or an embedding-model semantic gap between the query phrasing and how the paper actually discusses its limitations — a different class of problem than chunking, worth investigating separately (e.g. via query rewriting or a different embedding model).
+
+### Final Production Configuration
+
+| Stage                      | Configuration                           | Faithfulness | Answer Relevancy | Context Recall | Context Precision |
+| -------------------------- | --------------------------------------- | ------------ | ---------------- | -------------- | ----------------- |
+| Original baseline          | chunk=512/64, top_k=5, no reranker      | 0.80         | 0.81             | 0.75           | 0.40              |
+| Over-aggressive (rejected) | chunk=256/100, top_k=3                  | 0.56         | 0.79             | 0.58           | 0.778             |
+| **Final (production)**     | **chunk=256/100, top_k=4, reranker on** | **0.73**     | **0.81**         | **0.58**       | **0.75 (8q)**     |
+
+Context precision nearly doubles versus the original baseline (0.40 → 0.75) while faithfulness and answer relevancy stay close to their original levels. Context recall (0.75 → 0.58) is the one metric that didn't fully recover and is documented here as a known, deliberate tradeoff of smaller chunk sizes rather than an unexamined regression.
+
+The full experiment trail — including the `top_k=3` configuration that looked like a win on one metric but was caught and reverted after checking the complete evaluation suite, and the chunking-strategy comparison that found no difference once the test set was sized correctly — is the actual point of this section: tracking multiple metrics together, validating findings on an adequately sized test set, and being willing to report "no difference" rather than force a narrative, is what separates a real evaluation process from cherry-picked numbers.
 
 ### Run evaluation
 
@@ -213,11 +220,11 @@ Full RAG evaluation (generation + all 4 metrics):
 PYTHONPATH=src uv run python src/evaluate.py
 ```
 
-Isolated retrieval-quality experiments (compare retrieval configs without re-running generation):
+Isolated retrieval-quality experiments against any collection:
 
 ```bash
-PYTHONPATH=src uv run python src/log_retrieval.py --tag my_experiment
-PYTHONPATH=src uv run python src/log_retrieval.py --tag my_baseline --no-reranker
+PYTHONPATH=src uv run python src/log_retrieval.py --tag my_experiment --collection ai_papers
+PYTHONPATH=src uv run python src/log_retrieval.py --tag semantic_test --collection ai_papers_semantic --no-reranker
 ```
 
 View results at `http://localhost:5000`
@@ -250,7 +257,7 @@ cosine_sim(a, b) = (a · b) / (||a|| × ||b||)
 
 HNSW navigates a layered graph — O(log n) vs O(n) brute force. This stage is fast but approximate — it embeds the query and each chunk _separately_, so it can only capture topical similarity, not whether a chunk actually answers the question.
 
-**Stage 2 (precision):** The top-15 candidates are rescored by a cross-encoder, which takes (query, chunk) _jointly_ as input and outputs a single relevance logit. This is slower per-pair but far more accurate, so it's only applied to the small candidate set from stage 1, not the whole corpus. The top 4 by cross-encoder score become the final context — tuned down from an initial top 5, see Evaluation section for why 4 (not 3 or 5) is the balance point.
+**Stage 2 (precision):** The top-15 candidates are rescored by a cross-encoder, which takes (query, chunk) _jointly_ as input and outputs a single relevance logit. This is slower per-pair but far more accurate, so it's only applied to the small candidate set from stage 1, not the whole corpus. The top 4 by cross-encoder score become the final context.
 
 ### Generation — Grounded Prompting
 
@@ -258,13 +265,15 @@ Retrieved chunks are injected into a prompt that instructs the model to answer o
 
 ### Chunking Strategy
 
-Documents split with `RecursiveCharacterTextSplitter` (chunk_size=256, overlap=100), trying separators in order: `\n\n → \n → " " → ""` — preserving semantic boundaries before hard character splits. Chunk size was tuned down from an initial 512 after evaluation showed larger chunks diluted relevance by mixing multiple ideas per chunk (see Evaluation section above).
+Production uses `RecursiveCharacterTextSplitter` (chunk_size=256, overlap=100), trying separators in order: `\n\n → \n → " " → ""`. Two alternative strategies — semantic chunking and section-aware structured chunking — were implemented and evaluated; see the Evaluation section for why recursive splitting was kept as the production default despite the alternatives being more sophisticated in theory.
 
 ## Tech Decisions
 
 **Why Qdrant over ChromaDB?** Production-grade server with REST + gRPC API, proper HNSW tuning, and filtering on metadata payloads. ChromaDB is in-process only.
 
-**Why a cross-encoder reranker?** Bi-encoder vector search alone plateaued at 0.40 context precision. A reranker that jointly scores (query, chunk) pairs, combined with chunking and top_k tuning, lifted this to 0.75 while keeping faithfulness and answer relevancy near baseline — see the Evaluation section for the full validated experiment trail, including a precision-only "improvement" that was caught and reverted after checking the full metric suite.
+**Why a cross-encoder reranker?** Bi-encoder vector search alone plateaued at 0.40 context precision. A reranker that jointly scores (query, chunk) pairs, combined with chunking and top_k tuning, lifted this to 0.75 on a properly sized evaluation set — see the Evaluation section for the full validated experiment trail, including a precision-only "improvement" that was caught and reverted after checking the full metric suite.
+
+**Why recursive splitting over semantic/structured chunking in production?** Both alternatives were implemented and benchmarked on an 8-question test set; all three converged to identical context precision (0.75). Recursive splitting is simpler, faster at ingestion time (no per-sentence embedding calls, no regex header detection), and equally effective at this corpus scale — added sophistication wasn't justified by the data.
 
 **Why direct Ollama API over LangChain's OllamaLLM?** Qwen3's `think=False` parameter (disables chain-of-thought, cuts latency significantly) is only respected at the raw API level — LangChain's wrapper doesn't pass it through.
 

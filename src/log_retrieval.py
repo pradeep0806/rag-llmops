@@ -1,16 +1,14 @@
 """
-log_retrieval_quality.py — structured retrieval quality logging
+log_retrieval.py — structured retrieval quality logging
 
 Logs every retrieval configuration change as an MLflow run, so you can
-compare "before reranker" vs "after reranker" with real numbers instead
-of eyeballing terminal output.
-
-This is the proper LLMOps way to validate a change: run the same
-evaluation suite before and after, log both as MLflow runs, compare.
+compare chunking strategies, top_k, reranker on/off, etc. with real
+numbers instead of eyeballing terminal output.
 
 Usage:
-  PYTHONPATH=src uv run python src/log_retrieval_quality.py --tag baseline
-  PYTHONPATH=src uv run python src/log_retrieval_quality.py --tag with_reranker
+  PYTHONPATH=src uv run python src/log_retrieval.py --tag baseline
+  PYTHONPATH=src uv run python src/log_retrieval.py --tag semantic --collection ai_papers_semantic
+  PYTHONPATH=src uv run python src/log_retrieval.py --tag structured --collection ai_papers_structured
 """
 
 import os
@@ -27,7 +25,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import mlflow
-from rag_chain import get_retriever, call_ollama
+from langchain_ollama import OllamaEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from rag_chain import call_ollama
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -38,7 +39,37 @@ TEST_QUESTIONS = [
     "What is the attention mechanism in transformers?",
     "What is LoRA and how does it reduce parameters?",
     "How does RAG improve factual accuracy of LLMs?",
+    "What is multi-head attention and why use multiple heads?",
+    "How does LoRA compare to full fine-tuning in performance?",
+    "What is the encoder-decoder architecture in transformers?",
+    "What are the limitations of retrieval-augmented generation?",
+    "What is positional encoding and why is it needed?",
 ]
+
+
+def get_retriever_for_collection(collection_name: str, retrieve_k: int):
+    """
+    Build a retriever pointed at a specific Qdrant collection — lets us
+    A/B test chunking strategies (recursive vs semantic vs structured)
+    which each live in their own collection.
+    """
+    embeddings = OllamaEmbeddings(
+        model=os.getenv("EMBED_MODEL", "nomic-embed-text"),
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+    )
+    client = QdrantClient(
+        host=os.getenv("QDRANT_HOST", "localhost"),
+        port=int(os.getenv("QDRANT_PORT", 6333)),
+    )
+    vectorstore = QdrantVectorStore(
+        client=client,
+        collection_name=collection_name,
+        embedding=embeddings,
+    )
+    return vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": retrieve_k},
+    )
 
 
 def judge_relevance(question: str, chunk: str) -> bool:
@@ -52,15 +83,20 @@ Answer:"""
     return result.startswith("YES")
 
 
-def evaluate_retrieval(use_reranker: bool, tag: str):
+def evaluate_retrieval(use_reranker: bool, tag: str, collection_name: str):
     """
     Run retrieval-only evaluation (no generation) — isolates retrieval
     quality from generation quality, so we know exactly what we're
     measuring when we change retrieval config.
     """
-    retriever = get_retriever()
     retrieve_k = int(os.getenv("RETRIEVE_K", 15))
-    top_k = int(os.getenv("TOP_K", 3))
+    top_k = int(os.getenv("TOP_K", 4))
+
+    retriever = get_retriever_for_collection(collection_name, retrieve_k)
+
+    print(
+        f"\n[CONFIG] collection={collection_name} | retrieve_k={retrieve_k} | top_k={top_k} | reranker={'ON' if use_reranker else 'OFF'}\n"
+    )
 
     per_question_results = []
 
@@ -101,7 +137,6 @@ def evaluate_retrieval(use_reranker: bool, tag: str):
         per_question_results
     )
 
-    # Log to MLflow — every config change becomes a comparable run
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
     mlflow.set_experiment("retrieval-quality")
 
@@ -110,6 +145,7 @@ def evaluate_retrieval(use_reranker: bool, tag: str):
         mlflow.log_params(
             {
                 "tag": tag,
+                "collection": collection_name,
                 "use_reranker": use_reranker,
                 "retrieve_k": retrieve_k,
                 "top_k": top_k,
@@ -130,22 +166,26 @@ def evaluate_retrieval(use_reranker: bool, tag: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--tag",
-        default="run",
-        help="Label for this run, e.g. 'baseline' or 'with_reranker'",
-    )
+    parser.add_argument("--tag", default="run", help="Label for this run")
     parser.add_argument(
         "--no-reranker", action="store_true", help="Disable reranker for this run"
+    )
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help="Qdrant collection to query (defaults to QDRANT_COLLECTION env var)",
     )
     args = parser.parse_args()
 
     use_reranker = not args.no_reranker
+    collection_name = args.collection or os.getenv("QDRANT_COLLECTION", "ai_papers")
 
     print(
-        f"\nRunning retrieval quality eval | tag={args.tag} | reranker={'ON' if use_reranker else 'OFF'}\n"
+        f"\nRunning retrieval quality eval | tag={args.tag} | collection={collection_name} | reranker={'ON' if use_reranker else 'OFF'}\n"
     )
-    avg_precision, results = evaluate_retrieval(use_reranker=use_reranker, tag=args.tag)
+    avg_precision, results = evaluate_retrieval(
+        use_reranker=use_reranker, tag=args.tag, collection_name=collection_name
+    )
 
     print(f"\n=== Results ({args.tag}) ===")
     print(f"  Average Context Precision: {avg_precision:.4f}")
