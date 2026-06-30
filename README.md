@@ -188,19 +188,22 @@ Initial evaluation surfaced a weak Context Precision score (0.40) — meaning 60
 
 **Step 4 — Fix chunking granularity.** Reduced `CHUNK_SIZE` from 512 to 256 tokens (overlap 100). Smaller chunks isolate single ideas instead of mixing definition, formula, and implementation detail in one block. Result: 0.60 → 0.667.
 
-**Step 5 — Tighten `TOP_K` using reranker confidence.** Reranker scores revealed a real confidence cliff per query — e.g. one query's top-3 candidates scored `6.08, -0.22, -2.64` — only the top chunk was strongly relevant, yet a fixed `TOP_K=5` was force-including weak, low-confidence chunks just to hit a count. Reduced `TOP_K` from 5 to 3 to keep only chunks the reranker is actually confident about. Result: 0.667 → **0.778**.
+**Step 5 — Tighten `TOP_K` using reranker confidence.** Reranker scores revealed a real confidence cliff per query — e.g. one query's top-3 candidates scored `6.08, -0.22, -2.64` — only the top chunk was strongly relevant, yet a fixed `TOP_K=5` was force-including weak, low-confidence chunks just to hit a count. Tested `TOP_K=3`: context precision jumped to 0.778, but a full 4-metric evaluation (not just the isolated precision check) revealed a real cost — faithfulness dropped from 0.80 to 0.56 and context recall dropped from 0.75 to 0.58. Retrieving fewer, narrower chunks gave the model less material to construct a complete, well-grounded answer from — a textbook precision/recall tradeoff.
+
+**Step 6 — Find the balance point.** Tested `TOP_K=4` as a middle ground between the original 5 and the over-aggressive 3. This recovered faithfulness to 0.73 (close to the 0.80 baseline) while keeping context precision nearly double the original (0.75 vs 0.40), with answer relevancy unchanged. Context recall stayed flat at 0.58 between `top_k=3` and `top_k=4`, indicating recall is currently bottlenecked by chunk size, not top_k — a separate, known limitation rather than something tuning `top_k` further would fix.
 
 ### Results Summary
 
-| Stage                                    | Configuration                      | Avg Context Precision |
-| ---------------------------------------- | ---------------------------------- | --------------------- |
-| Baseline                                 | chunk=512/64, top_k=5, no reranker | 0.40                  |
-| + Reranker                               | chunk=512/64, top_k=5              | 0.60                  |
-| + Wider retrieval (hypothesis ruled out) | retrieve_k=25                      | 0.60 (no change)      |
-| + Smaller chunks                         | chunk=256/100, top_k=5             | 0.667                 |
-| + Tighter top_k                          | chunk=256/100, top_k=3             | **0.778**             |
+| Stage                      | Configuration                      | Faithfulness | Answer Relevancy | Context Recall | Context Precision |
+| -------------------------- | ---------------------------------- | ------------ | ---------------- | -------------- | ----------------- |
+| Baseline                   | chunk=512/64, top_k=5, no reranker | 0.80         | 0.81             | 0.75           | 0.40              |
+| + Reranker, smaller chunks | chunk=256/100, top_k=5             | —            | —                | —              | 0.667             |
+| Over-aggressive top_k      | chunk=256/100, top_k=3             | 0.56         | 0.79             | 0.58           | 0.778             |
+| **Final (balanced)**       | **chunk=256/100, top_k=4**         | **0.73**     | **0.81**         | **0.58**       | **0.75**          |
 
-Net result: a **95% relative improvement** in Context Precision (0.40 → 0.778), achieved through three validated interventions — reranking, chunk granularity, and confidence-based top_k tuning — each isolated and proven via controlled, MLflow-logged experiments rather than guesswork. One hypothesis (wider retrieval depth) was tested and explicitly ruled out, demonstrating that not every plausible fix is the right one.
+The final configuration nearly doubles context precision (0.40 → 0.75) while keeping faithfulness and answer relevancy close to their original levels. Context recall (0.75 → 0.58) is the one metric that didn't fully recover — it's bottlenecked by the smaller chunk size rather than `top_k`, and is documented here as a known, deliberate tradeoff rather than an unexamined regression.
+
+This process is the actual point: the first "improvement" (`top_k=3`, precision 0.778) looked like a win on a single metric but was a regression once measured against the full evaluation suite. Tracking all 4 metrics together — not optimizing one in isolation — is what caught it.
 
 ### Run evaluation
 
@@ -247,7 +250,7 @@ cosine_sim(a, b) = (a · b) / (||a|| × ||b||)
 
 HNSW navigates a layered graph — O(log n) vs O(n) brute force. This stage is fast but approximate — it embeds the query and each chunk _separately_, so it can only capture topical similarity, not whether a chunk actually answers the question.
 
-**Stage 2 (precision):** The top-15 candidates are rescored by a cross-encoder, which takes (query, chunk) _jointly_ as input and outputs a single relevance logit. This is slower per-pair but far more accurate, so it's only applied to the small candidate set from stage 1, not the whole corpus. The top 3 by cross-encoder score become the final context.
+**Stage 2 (precision):** The top-15 candidates are rescored by a cross-encoder, which takes (query, chunk) _jointly_ as input and outputs a single relevance logit. This is slower per-pair but far more accurate, so it's only applied to the small candidate set from stage 1, not the whole corpus. The top 4 by cross-encoder score become the final context — tuned down from an initial top 5, see Evaluation section for why 4 (not 3 or 5) is the balance point.
 
 ### Generation — Grounded Prompting
 
@@ -261,7 +264,7 @@ Documents split with `RecursiveCharacterTextSplitter` (chunk_size=256, overlap=1
 
 **Why Qdrant over ChromaDB?** Production-grade server with REST + gRPC API, proper HNSW tuning, and filtering on metadata payloads. ChromaDB is in-process only.
 
-**Why a cross-encoder reranker?** Bi-encoder vector search alone plateaued at 0.40 context precision. A reranker that jointly scores (query, chunk) pairs lifted this to 0.60 immediately — see the Evaluation section for the full validated experiment trail.
+**Why a cross-encoder reranker?** Bi-encoder vector search alone plateaued at 0.40 context precision. A reranker that jointly scores (query, chunk) pairs, combined with chunking and top_k tuning, lifted this to 0.75 while keeping faithfulness and answer relevancy near baseline — see the Evaluation section for the full validated experiment trail, including a precision-only "improvement" that was caught and reverted after checking the full metric suite.
 
 **Why direct Ollama API over LangChain's OllamaLLM?** Qwen3's `think=False` parameter (disables chain-of-thought, cuts latency significantly) is only respected at the raw API level — LangChain's wrapper doesn't pass it through.
 
